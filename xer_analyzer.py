@@ -8,7 +8,7 @@ import threading
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
-from collections import defaultdict, deque
+from collections import defaultdict
 
 EXEC_TIMEOUT_SECONDS = 30
 
@@ -19,264 +19,49 @@ EXEC_TIMEOUT_SECONDS = 30
 
 class XERInsightsEngine:
     """
-    Computes insight sets from structured task data.
+    Computes three insight sets from structured task data.
+    All computation is done against pre-parsed task objects — no LLM involved.
 
-    Runs a full CPM forward/backward pass (not P6's pre-computed flags) so
-    float and criticality are independently verified and can support what-if
-    queries. Delay propagation uses BFS through the successor graph, bleeding
-    slip through downstream float buffers.
+    Results are stored as plain dicts/lists so they can be:
+      - shown directly in the UI
+      - injected into LLM prompts as ground truth
+      - queried by LLM-generated code via the executor context
     """
 
     def compute(self, tasks_list: List[Dict], data_date: str) -> Dict:
         """
         Returns:
-          delays            — tasks with start or finish slip vs plan
-          critical_path     — ordered critical work tasks with driving predecessor
-          resources         — aggregated cost/qty per resource with variance flags
-          delay_propagation — downstream cascade analysis for each delayed task
-          cpm               — per-task CPM results {task_id: {float, is_critical, ...}}
+          delays          — tasks with start or finish slip vs plan
+          critical_path   — ordered critical work tasks (by planned_start)
+          resources       — aggregated cost/qty per resource across all tasks
         """
         try:
             dd = datetime.strptime(data_date[:10], '%Y-%m-%d') if data_date else None
         except ValueError:
             dd = None
 
-        # Build indexes once; shared across all methods
-        task_map: Dict[str, Dict] = {t['task_id']: t for t in tasks_list}
-        succ_map: Dict[str, List[Dict]] = defaultdict(list)
-        pred_map: Dict[str, List[Dict]] = defaultdict(list)
-        for t in tasks_list:
-            tid = t['task_id']
-            for s in t['relationships']['successors']:
-                succ_map[tid].append(s)
-            for p in t['relationships']['predecessors']:
-                pred_map[tid].append(p)
-
-        delays         = self._delays(tasks_list, dd)
-        cpm            = self._run_cpm(tasks_list, task_map, succ_map, pred_map)
-        critical_path  = self._critical_path(tasks_list, task_map, succ_map, pred_map, cpm)
-        resources      = self._resources(tasks_list)
-        delay_prop     = self._delay_propagation(tasks_list, delays, task_map, succ_map)
-
         return {
-            'delays':            delays,
-            'critical_path':     critical_path,
-            'resources':         resources,
-            'delay_propagation': delay_prop,
-            'cpm':               cpm,
+            'delays':        self._delays(tasks_list, dd),
+            'critical_path': self._critical_path(tasks_list),
+            'resources':     self._resources(tasks_list),
         }
-
-    # ── Real CPM ──────────────────────────────────────────────────────────────
-
-    def _run_cpm(
-        self,
-        tasks_list: List[Dict],
-        task_map:   Dict,
-        succ_map:   Dict,
-        pred_map:   Dict,
-    ) -> Dict:
-        """
-        Independent forward/backward pass CPM using ordinal-day arithmetic.
-
-        Relationship types handled: FS, SS, FF, SF (with lags).
-        Completed tasks are pinned to their actual dates.
-        In-progress tasks use actual start + remaining duration.
-        Not-started tasks are scheduled from their latest predecessor.
-
-        Returns {task_id: {total_float_days, is_critical, has_negative_float}}
-        """
-        all_ids = set(task_map.keys())
-
-        # ── Helpers ───────────────────────────────────────────────────────────
-
-        def remaining(tid: str) -> float:
-            t = task_map[tid]
-            return 0.0 if t['status'] == 'TK_Complete' else max(
-                0.0, t['duration'].get('remaining_days', 0.0)
-            )
-
-        def fixed_es(tid: str) -> Optional[int]:
-            """Return actual_start ordinal for started tasks; None otherwise."""
-            t = task_map[tid]
-            if t['status'] in ('TK_Complete', 'TK_Active'):
-                d = _parse_date(t['dates'].get('actual_start'))
-                if d:
-                    return d.toordinal()
-            return None
-
-        def fixed_ef(tid: str) -> Optional[int]:
-            """Return actual_finish ordinal for complete tasks; None otherwise."""
-            t = task_map[tid]
-            if t['status'] == 'TK_Complete':
-                d = _parse_date(t['dates'].get('actual_finish'))
-                if d:
-                    return d.toordinal()
-            return None
-
-        # ── Topological sort (Kahn's) ─────────────────────────────────────────
-
-        in_deg: Dict[str, int] = {
-            tid: sum(1 for p in pred_map.get(tid, []) if p['task_id'] in all_ids)
-            for tid in all_ids
-        }
-        queue: deque = deque(tid for tid in all_ids if in_deg[tid] == 0)
-        topo:  List[str] = []
-        seen:  set = set()
-
-        while queue:
-            tid = queue.popleft()
-            if tid in seen:
-                continue
-            seen.add(tid)
-            topo.append(tid)
-            for s in succ_map.get(tid, []):
-                sid = s['task_id']
-                if sid in in_deg:
-                    in_deg[sid] -= 1
-                    if in_deg[sid] <= 0 and sid not in seen:
-                        queue.append(sid)
-
-        # Append any tasks in cycles (skip-safe)
-        for tid in all_ids:
-            if tid not in seen:
-                topo.append(tid)
-
-        # Project reference start (earliest planned start across all tasks)
-        p_dates = [
-            _parse_date(t['dates'].get('planned_start') or t['dates'].get('early_start'))
-            for t in tasks_list
-        ]
-        proj_start = min(d.toordinal() for d in p_dates if d) if any(p_dates) else 0
-
-        # ── Forward pass ──────────────────────────────────────────────────────
-
-        es_ord: Dict[str, float] = {}
-        ef_ord: Dict[str, float] = {}
-
-        for tid in topo:
-            dur = remaining(tid)
-            fe  = fixed_ef(tid)
-            fs  = fixed_es(tid)
-
-            # Completed: pin to actual dates
-            if fe is not None:
-                ef_ord[tid] = float(fe)
-                es_ord[tid] = float(fs) if fs is not None else float(fe) - dur
-                continue
-
-            # In-progress: ES is fixed (actual start), EF floats
-            if fs is not None:
-                es_ord[tid] = float(fs)
-            else:
-                # Not started: drive from predecessors
-                candidates: List[float] = []
-                for p in pred_map.get(tid, []):
-                    pid = p['task_id']
-                    if pid not in ef_ord:
-                        continue
-                    rel = p.get('type', 'FS')
-                    lag = float(p.get('lag_days', 0))
-
-                    # Standard CPM forward constraints:
-                    # FS: ES_j >= EF_i + lag
-                    # SS: ES_j >= ES_i + lag
-                    # FF: EF_j >= EF_i + lag  →  ES_j >= EF_i + lag - dur_j
-                    # SF: EF_j >= ES_i + lag  →  ES_j >= ES_i + lag - dur_j
-                    if rel == 'FS':
-                        candidates.append(ef_ord[pid] + lag)
-                    elif rel == 'SS':
-                        candidates.append(es_ord.get(pid, ef_ord[pid]) + lag)
-                    elif rel == 'FF':
-                        candidates.append(ef_ord[pid] + lag - dur)
-                    elif rel == 'SF':
-                        candidates.append(es_ord.get(pid, ef_ord[pid]) + lag - dur)
-                    else:
-                        candidates.append(ef_ord[pid] + lag)
-
-                if candidates:
-                    es_ord[tid] = max(candidates)
-                else:
-                    t    = task_map[tid]
-                    pd_d = _parse_date(
-                        t['dates'].get('planned_start') or t['dates'].get('early_start')
-                    )
-                    es_ord[tid] = float(pd_d.toordinal()) if pd_d else float(proj_start)
-
-            ef_ord[tid] = es_ord[tid] + dur
-
-        if not ef_ord:
-            return {}
-
-        proj_end = max(ef_ord.values())
-
-        # ── Backward pass ─────────────────────────────────────────────────────
-
-        lf_ord: Dict[str, float] = {}
-        ls_ord: Dict[str, float] = {}
-
-        for tid in reversed(topo):
-            dur = remaining(tid)
-
-            # Completed: pin to actual
-            if task_map[tid]['status'] == 'TK_Complete':
-                lf_ord[tid] = ef_ord.get(tid, proj_end)
-                ls_ord[tid] = es_ord.get(tid, lf_ord[tid] - dur)
-                continue
-
-            constraints: List[float] = []
-            for s in succ_map.get(tid, []):
-                sid = s['task_id']
-                if sid not in ls_ord:
-                    continue
-                rel = s.get('type', 'FS')
-                lag = float(s.get('lag_days', 0))
-
-                # Standard CPM backward constraints (tid = predecessor, sid = successor):
-                # FS: LF_pred = LS_succ - lag
-                # SS: LS_pred = LS_succ - lag  →  LF_pred = LS_succ - lag + dur_pred
-                # FF: LF_pred = LF_succ - lag
-                # SF: LS_pred = LF_succ - lag  →  LF_pred = LF_succ - lag + dur_pred
-                if rel == 'FS':
-                    constraints.append(ls_ord[sid] - lag)
-                elif rel == 'SS':
-                    constraints.append(ls_ord[sid] - lag + dur)
-                elif rel == 'FF':
-                    constraints.append(lf_ord.get(sid, proj_end) - lag)
-                elif rel == 'SF':
-                    constraints.append(lf_ord.get(sid, proj_end) - lag + dur)
-                else:
-                    constraints.append(ls_ord[sid] - lag)
-
-            lf_ord[tid] = min(constraints) if constraints else proj_end
-            ls_ord[tid] = lf_ord[tid] - dur
-
-        # ── Assemble results ──────────────────────────────────────────────────
-
-        cpm_results: Dict[str, Dict] = {}
-        for tid in all_ids:
-            if tid not in ef_ord:
-                continue
-            ef = ef_ord.get(tid, 0.0)
-            lf = lf_ord.get(tid, proj_end)
-            tf = lf - ef
-            cpm_results[tid] = {
-                'total_float_days':   round(tf, 1),
-                'is_critical':        tf <= 0,
-                'has_negative_float': tf < 0,
-            }
-
-        return cpm_results
 
     # ── Delays ────────────────────────────────────────────────────────────────
 
     def _delays(self, tasks_list: List[Dict], data_date: datetime) -> List[Dict]:
         """
-        Start/finish slip for every task that has begun.
-        In-progress tasks use data_date as a proxy for actual finish.
+        For every task that has started or finished, compute slip in days:
+          start_slip  = actual_start  - planned_start   (positive = late)
+          finish_slip = actual_finish - planned_finish  (positive = late)
+
+        For in-progress tasks with no actual_finish, finish_slip is estimated
+        as: start_slip + (remaining_days - original_remaining_days).
+        We flag any task where start_slip > 0 OR finish_slip > 0.
+        Results sorted worst finish slip first.
         """
         rows = []
         for t in tasks_list:
-            if t['task_type'] == 'TT_LOE':
+            if t['task_type'] in ('TT_LOE',):
                 continue
             if t['status'] == 'TK_NotStart':
                 continue
@@ -287,210 +72,74 @@ class XERInsightsEngine:
             a_start = _parse_date(dates.get('actual_start'))
             a_fin   = _parse_date(dates.get('actual_finish'))
 
-            start_slip  = _day_diff(a_start, p_start)
+            start_slip  = _day_diff(a_start, p_start)   # None if either missing
             finish_slip = _day_diff(a_fin,   p_fin)
 
+            # For in-progress tasks use data_date as proxy for actual finish
             if finish_slip is None and t['status'] == 'TK_Active' and data_date and p_fin:
                 finish_slip = _day_diff(data_date, p_fin)
 
+            # Only include if there is some slip
             if (start_slip or 0) <= 0 and (finish_slip or 0) <= 0:
                 continue
 
             rows.append({
-                'task_code':        t['task_code'],
-                'task_name':        t['task_name'],
-                'wbs_path':         t['wbs_path'],
-                'status':           t['status'],
-                'planned_start':    dates.get('planned_start'),
-                'actual_start':     dates.get('actual_start'),
-                'planned_finish':   dates.get('planned_finish'),
-                'actual_finish':    dates.get('actual_finish'),
-                'start_slip_days':  start_slip,
+                'task_code':       t['task_code'],
+                'task_name':       t['task_name'],
+                'wbs_path':        t['wbs_path'],
+                'status':          t['status'],
+                'planned_start':   dates.get('planned_start'),
+                'actual_start':    dates.get('actual_start'),
+                'planned_finish':  dates.get('planned_finish'),
+                'actual_finish':   dates.get('actual_finish'),
+                'start_slip_days': start_slip,
                 'finish_slip_days': finish_slip,
-                'is_critical':      t['float']['is_critical'],
+                'is_critical':     t['float']['is_critical'],
             })
 
         rows.sort(key=lambda r: (r['finish_slip_days'] or 0), reverse=True)
-        return rows[:50]
-
-    # ── Delay Propagation ─────────────────────────────────────────────────────
-
-    def _delay_propagation(
-        self,
-        tasks_list: List[Dict],
-        delays:     List[Dict],
-        task_map:   Dict,
-        succ_map:   Dict,
-    ) -> List[Dict]:
-        """
-        BFS from each delayed source task through its successors.
-
-        At each hop, the propagated slip is reduced by the successor's
-        available float and the incoming relationship lag. If net impact > 0
-        the successor is affected and becomes a new frontier node.
-
-        Result is sorted by source slip (worst first), capped at top-20 sources
-        and top-10 impacted tasks each.
-        """
-        code_to_id = {t['task_code']: t['task_id'] for t in tasks_list}
-        propagation: List[Dict] = []
-
-        for delay in delays[:20]:
-            slip = float(delay.get('finish_slip_days') or delay.get('start_slip_days') or 0)
-            if slip <= 0:
-                continue
-
-            source_id = code_to_id.get(delay['task_code'])
-            if not source_id:
-                continue
-
-            visited:  set   = {source_id}
-            frontier: deque = deque([(source_id, slip)])
-            impacted: List[Dict] = []
-
-            while frontier:
-                current_id, propagated_slip = frontier.popleft()
-
-                for s in succ_map.get(current_id, []):
-                    sid = s['task_id']
-                    if sid in visited:
-                        continue
-                    visited.add(sid)
-
-                    st = task_map.get(sid)
-                    if not st or st['status'] == 'TK_Complete':
-                        continue  # Already done — not at risk
-
-                    available_float = st['float'].get('total_float_days', 0.0)
-                    rel_lag         = float(s.get('lag_days', 0))
-                    net_impact      = propagated_slip - available_float - rel_lag
-
-                    if net_impact > 0:
-                        impacted.append({
-                            'task_code':            st['task_code'],
-                            'task_name':            st['task_name'],
-                            'status':               st['status'],
-                            'available_float':      round(available_float, 1),
-                            'estimated_impact_days': round(net_impact, 1),
-                            'is_critical':          st['float']['is_critical'],
-                        })
-                        frontier.append((sid, net_impact))
-
-            if impacted:
-                impacted.sort(key=lambda x: -x['estimated_impact_days'])
-                propagation.append({
-                    'source_task_code':    delay['task_code'],
-                    'source_task_name':    delay['task_name'],
-                    'slip_days':           slip,
-                    'impacted_task_count': len(impacted),
-                    'impacted_tasks':      impacted[:10],
-                })
-
-        propagation.sort(key=lambda x: -x['slip_days'])
-        return propagation
+        return rows[:50]  # cap at 50
 
     # ── Critical path ─────────────────────────────────────────────────────────
 
-    def _critical_path(
-        self,
-        tasks_list: List[Dict],
-        task_map:   Dict,
-        succ_map:   Dict,
-        pred_map:   Dict,
-        cpm:        Dict,
-    ) -> List[Dict]:
+    def _critical_path(self, tasks_list: List[Dict]) -> List[Dict]:
         """
-        Incomplete critical work tasks ordered by planned_start.
-
-        Uses CPM-computed float where available; falls back to P6's flag.
-        Each task includes its driving predecessor (the predecessor with the
-        tightest float, i.e., the one actually driving this task's late start).
+        Returns critical work tasks ordered by planned_start.
+        This is NOT a CPM re-calculation — it uses P6's pre-computed is_critical flag.
+        The ordered list shows the sequence of tasks driving the project end date.
         """
-        critical: List[Dict] = []
+        critical = [
+            t for t in tasks_list
+            if t['float']['is_critical']
+            and t['task_type'] == 'TT_Task'
+            and t['status'] != 'TK_Complete'
+        ]
+        critical.sort(key=lambda t: t['dates'].get('planned_start') or '')
 
-        for t in tasks_list:
-            if t['task_type'] != 'TT_Task':
-                continue
-            if t['status'] == 'TK_Complete':
-                continue
-
-            tid      = t['task_id']
-            cpm_data = cpm.get(tid, {})
-
-            # Prefer independently computed criticality
-            is_crit  = cpm_data.get('is_critical',        t['float']['is_critical'])
-            has_neg  = cpm_data.get('has_negative_float', t['float']['has_negative_float'])
-            cpm_float = cpm_data.get('total_float_days',  t['float']['total_float_days'])
-
-            if not is_crit:
-                continue
-
-            driving_pred = self._find_driving_predecessor(tid, pred_map, task_map, cpm)
-
-            critical.append({
-                'task_code':          t['task_code'],
-                'task_name':          t['task_name'],
-                'wbs_path':           t['wbs_path'],
-                'status':             t['status'],
-                'planned_start':      t['dates'].get('planned_start'),
-                'planned_finish':     t['dates'].get('planned_finish'),
-                'duration_days':      t['duration']['planned_days'],
-                'remaining_days':     t['duration']['remaining_days'],
-                'float_days':         cpm_float,
-                'has_negative_float': has_neg,
-                'predecessor_count':  t['relationships']['predecessor_count'],
-                'successor_count':    t['relationships']['successor_count'],
-                'driving_predecessor': driving_pred,
-            })
-
-        critical.sort(key=lambda t: t['planned_start'] or '')
-        return critical
-
-    def _find_driving_predecessor(
-        self,
-        tid:      str,
-        pred_map: Dict,
-        task_map: Dict,
-        cpm:      Dict,
-    ) -> Optional[Dict]:
-        """
-        The driving predecessor is the one with the least float —
-        it has no schedule cushion to absorb further delay, so it is
-        the constraint that is actually driving this task's late start.
-        """
-        best_float = float('inf')
-        driving: Optional[Dict] = None
-
-        for p in pred_map.get(tid, []):
-            pid = p['task_id']
-            pt  = task_map.get(pid)
-            if not pt:
-                continue
-            pred_float = cpm.get(pid, {}).get(
-                'total_float_days', pt['float'].get('total_float_days', 0.0)
-            )
-            if pred_float < best_float:
-                best_float = pred_float
-                driving    = {
-                    'task_code':  pt['task_code'],
-                    'task_name':  pt['task_name'],
-                    'float_days': round(pred_float, 1),
-                    'rel_type':   p.get('type', 'FS'),
-                    'lag_days':   p.get('lag_days', 0),
-                }
-
-        return driving
+        return [
+            {
+                'task_code':       t['task_code'],
+                'task_name':       t['task_name'],
+                'wbs_path':        t['wbs_path'],
+                'status':          t['status'],
+                'planned_start':   t['dates'].get('planned_start'),
+                'planned_finish':  t['dates'].get('planned_finish'),
+                'duration_days':   t['duration']['planned_days'],
+                'remaining_days':  t['duration']['remaining_days'],
+                'float_days':      t['float']['total_float_days'],
+                'has_negative_float': t['float']['has_negative_float'],
+                'predecessor_count': t['relationships']['predecessor_count'],
+                'successor_count':   t['relationships']['successor_count'],
+            }
+            for t in critical
+        ]
 
     # ── Resources ─────────────────────────────────────────────────────────────
 
     def _resources(self, tasks_list: List[Dict]) -> List[Dict]:
         """
-        Aggregate cost and qty per resource with variance analysis:
-          cost_variance  = planned - actual - remaining  (negative = over budget)
-          spend_pct      = actual / planned × 100
-          is_overloaded  = actual_qty > planned_qty by more than 10%
-          is_over_budget = cost_variance < 0
-        Sorted by planned_cost descending.
+        Aggregate planned/actual/remaining cost and qty per resource
+        across all task assignments. Sort by planned_cost descending.
         """
         agg: Dict[str, Dict] = {}
 
@@ -499,15 +148,15 @@ class XERInsightsEngine:
                 name = r.get('resource_name') or r.get('resource_id', 'Unknown')
                 if name not in agg:
                     agg[name] = {
-                        'resource_name':  name,
-                        'resource_type':  r.get('resource_type', ''),
-                        'task_count':     0,
-                        'planned_cost':   0.0,
-                        'actual_cost':    0.0,
-                        'remaining_cost': 0.0,
-                        'planned_qty':    0.0,
-                        'actual_qty':     0.0,
-                        'remaining_qty':  0.0,
+                        'resource_name':   name,
+                        'resource_type':   r.get('resource_type', ''),
+                        'task_count':      0,
+                        'planned_cost':    0.0,
+                        'actual_cost':     0.0,
+                        'remaining_cost':  0.0,
+                        'planned_qty':     0.0,
+                        'actual_qty':      0.0,
+                        'remaining_qty':   0.0,
                     }
                 a = agg[name]
                 a['task_count']     += 1
@@ -520,22 +169,11 @@ class XERInsightsEngine:
 
         result = sorted(agg.values(), key=lambda x: x['planned_cost'], reverse=True)
 
+        # Round floats
         for r in result:
             for k in ('planned_cost', 'actual_cost', 'remaining_cost',
                       'planned_qty',  'actual_qty',  'remaining_qty'):
                 r[k] = round(r[k], 2)
-
-            # Variance: positive means we have budget left; negative = over
-            r['cost_variance']  = round(
-                r['planned_cost'] - r['actual_cost'] - r['remaining_cost'], 2
-            )
-            r['spend_pct']      = round(
-                r['actual_cost'] / r['planned_cost'] * 100, 1
-            ) if r['planned_cost'] else 0.0
-            r['is_overloaded']  = (
-                r['planned_qty'] > 0 and r['actual_qty'] > r['planned_qty'] * 1.1
-            )
-            r['is_over_budget'] = r['cost_variance'] < 0
 
         return result
 
@@ -571,28 +209,28 @@ class XERDataStore:
     def __init__(self):
         self.baseline: Optional[Dict]    = None
         self.updates:  List[Dict]        = []
-        self._cached_stats:   Optional[Dict] = None
+        self._cached_stats:  Optional[Dict] = None
         self._cached_insights: Optional[Dict] = None
         self._insights_engine = XERInsightsEngine()
 
     # ── Load / add / remove ───────────────────────────────
 
     def load_baseline(self, data: Dict, name: str, data_date: str):
-        self.baseline          = self._build_source(data, name, data_date)
-        self._cached_stats     = None
-        self._cached_insights  = None
+        self.baseline        = self._build_source(data, name, data_date)
+        self._cached_stats   = None
+        self._cached_insights = None
 
     def add_update(self, data: Dict, name: str, data_date: str):
         self.updates.append(self._build_source(data, name, data_date))
         self.updates.sort(key=lambda x: x['data_date'])
-        self._cached_stats     = None
-        self._cached_insights  = None
+        self._cached_stats   = None
+        self._cached_insights = None
 
     def remove_update(self, index: int):
         if 0 <= index < len(self.updates):
             self.updates.pop(index)
-            self._cached_stats     = None
-            self._cached_insights  = None
+            self._cached_stats   = None
+            self._cached_insights = None
 
     def _build_source(self, data: Dict, name: str, data_date: str) -> Dict:
         tasks_list = data.get('tasks', [])
@@ -637,10 +275,6 @@ class XERDataStore:
                 'planned_finish': t['dates'].get('planned_finish'),
                 'actual_start':   t['dates'].get('actual_start'),
                 'actual_finish':  t['dates'].get('actual_finish'),
-                'early_start':    t['dates'].get('early_start'),
-                'early_finish':   t['dates'].get('early_finish'),
-                'late_start':     t['dates'].get('late_start'),
-                'late_finish':    t['dates'].get('late_finish'),
                 'predecessor_count': t['relationships']['predecessor_count'],
                 'successor_count':   t['relationships']['successor_count'],
                 'is_open_ended':     t['relationships']['is_open_ended'],
@@ -651,8 +285,7 @@ class XERDataStore:
             })
 
         tasks_df = pd.DataFrame(rows)
-        for col in ['planned_start', 'planned_finish', 'actual_start', 'actual_finish',
-                    'early_start', 'early_finish', 'late_start', 'late_finish']:
+        for col in ['planned_start', 'planned_finish', 'actual_start', 'actual_finish']:
             tasks_df[col] = pd.to_datetime(tasks_df[col], errors='coerce')
 
         return {'tasks': tasks_df}
@@ -842,11 +475,10 @@ class XERQueryExecutor:
 
             'task_by_id':   _idx(latest).get('tasks_by_id', {}),
             'tasks_by_wbs': _idx(latest).get('tasks_by_wbs', {}),
-            # Full relationship objects (not just IDs) for CPM/path traversal
             'successors':   _idx(latest).get('successors', {}),
             'predecessors': _idx(latest).get('predecessors', {}),
 
-            # Pre-computed insights — use these for delay/critical/resource/propagation questions
+            # Pre-computed insights available for LLM code to reference
             'insights': self.data_store.compute_insights(),
 
             'get_update_by_month': self.data_store.get_update_by_month,
@@ -986,17 +618,9 @@ get_update_by_month('mar') : returns update source dict
   → list: get_update_by_month('mar')['tasks_list']
 
 insights         : pre-computed insights dict with keys:
-  insights['delays']            → list of delayed tasks (start_slip_days, finish_slip_days)
-  insights['critical_path']     → ordered list of critical work tasks (CPM-computed float)
-                                   each task includes: driving_predecessor dict
-  insights['resources']         → list of resources with cost_variance, spend_pct,
-                                   is_overloaded, is_over_budget flags
-  insights['delay_propagation'] → BFS cascade analysis per delayed task:
-                                   source_task_code, slip_days, impacted_task_count,
-                                   impacted_tasks[{{task_code, estimated_impact_days, available_float}}]
-  insights['cpm']               → dict keyed by task_id:
-                                   {{total_float_days, is_critical, has_negative_float}}
-                                   This is an INDEPENDENT CPM calculation, not P6's flag.
+  insights['delays']         → list of delayed tasks (start_slip_days, finish_slip_days)
+  insights['critical_path']  → ordered list of critical work tasks
+  insights['resources']      → list of resources with aggregated cost/qty
 
 FAST INDEXES:
   task_by_id[task_id]      → full task dict
@@ -1021,27 +645,17 @@ task['resources']   → [{{resource_name, planned_qty, actual_qty, planned_cost,
 task['constraints'] → {{'type': 'CS_MSOA', 'date': '2024-03-01'}} or None
 task['notes']       → [{{memo_type, text}}]
 task['period_actuals'] → [{{period_name, period_start, period_end, actual_cost, actual_work_qty}}]
-task['dates']['early_start'], task['dates']['early_finish'],
-task['dates']['late_start'],  task['dates']['late_finish']
 
 ── CORRECT PATTERNS ──────────────────────────────────────
 
 # Use insights directly for delay/critical/resource questions
 result = insights['delays'][:20]
 
-# Cascade impact from the most delayed task
-result = insights['delay_propagation'][:5]
-
-# Critical path sequence with driving predecessors
+# Critical path sequence
 result = insights['critical_path']
 
-# Resources over budget or overloaded
-result = [r for r in insights['resources'] if r['is_over_budget'] or r['is_overloaded']]
-
-# CPM-computed float for a specific task
-task_id = next((t['task_id'] for t in tasks_list if t['task_code'] == 'A1000'), None)
-if task_id:
-    result = insights['cpm'].get(task_id)
+# Resource summary
+result = insights['resources']
 
 # Bulk filter
 critical = tasks_df[tasks_df['is_critical'] & (tasks_df['task_type'] == 'TT_Task')]
@@ -1074,32 +688,23 @@ Return ONLY valid Python code. No explanations."""
     ) -> str:
         insights = insights or {}
 
-        delays        = insights.get('delays', [])
+        # Summarise delays for context
+        delays       = insights.get('delays', [])
         delayed_count = len(delays)
-        worst_delays  = delays[:3]
-        worst_str     = ', '.join(
+        worst_delays  = delays[:3]  # top 3 for context block
+        worst_str = ', '.join(
             d['task_code'] + ' (' + str(d['finish_slip_days']) + 'd slip)'
             for d in worst_delays
         )
         delay_line = str(delayed_count) + (' — worst: ' + worst_str if worst_str else '')
 
-        resources          = insights.get('resources', [])
+        # Resource totals
+        resources    = insights.get('resources', [])
         total_planned_cost = sum(r.get('planned_cost', 0) for r in resources)
-        over_budget_count  = sum(1 for r in resources if r.get('is_over_budget'))
-        overloaded_count   = sum(1 for r in resources if r.get('is_overloaded'))
 
+        # Critical path length
         cp           = insights.get('critical_path', [])
         cp_remaining = sum(t.get('remaining_days', 0) for t in cp)
-        neg_float_cp = sum(1 for t in cp if t.get('has_negative_float'))
-
-        delay_prop   = insights.get('delay_propagation', [])
-        cascade_str  = ''
-        if delay_prop:
-            top = delay_prop[0]
-            cascade_str = (
-                f" | Top cascade: {top['source_task_code']} ({top['slip_days']:.0f}d slip)"
-                f" impacts {top['impacted_task_count']} downstream tasks"
-            )
 
         ctx = f"""USER QUESTION: {user_query}
 
@@ -1111,19 +716,18 @@ PROJECT OVERVIEW:
 STATUS: Completed={basic_stats.get('completed','N/A')} | In Progress={basic_stats.get('in_progress','N/A')} | Not Started={basic_stats.get('not_started','N/A')}
 
 SCHEDULE HEALTH:
-- Critical (CPM-computed): {basic_stats.get('critical_count','N/A')} ({basic_stats.get('critical_pct','N/A')}%) | Near-Critical: {basic_stats.get('near_critical_count','N/A')}
+- Critical: {basic_stats.get('critical_count','N/A')} ({basic_stats.get('critical_pct','N/A')}%) | Near-Critical: {basic_stats.get('near_critical_count','N/A')}
 - Negative Float: {basic_stats.get('negative_float_count','N/A')} | Open-Ended: {basic_stats.get('open_ended_count','N/A')} | Dangling: {basic_stats.get('dangling_count','N/A')}
 - Long Duration >30d: {basic_stats.get('long_duration_count','N/A')} | Constrained: {basic_stats.get('constrained_activities','N/A')}
 
 RELATIONSHIPS: Total={basic_stats.get('total_relationships','N/A')} | With Lag={basic_stats.get('relationships_with_lag','N/A')} | Negative Lags={basic_stats.get('negative_lags','N/A')}
-RESOURCES: {basic_stats.get('resource_loaded_count','N/A')} tasks loaded | Total Planned Cost: {total_planned_cost:,.0f} | Over Budget: {over_budget_count} | Overloaded: {overloaded_count}
+RESOURCES: {basic_stats.get('resource_loaded_count','N/A')} tasks loaded | Total Planned Cost: {total_planned_cost:,.0f}
 FILES: Baseline={basic_stats.get('baseline_name','N/A')} ({basic_stats.get('baseline_date','N/A')}) | Updates={basic_stats.get('update_count',0)}
 
 INSIGHTS SUMMARY:
 - Delayed tasks: {delay_line}
-- Cascade risk: {len(delay_prop)} delayed tasks propagate downstream{cascade_str}
-- Critical path: {len(cp)} tasks remaining | {cp_remaining:.0f}d total remaining | {neg_float_cp} with negative float
-- Resources: {len(resources)} tracked | {over_budget_count} over budget | {overloaded_count} overloaded
+- Critical path: {len(cp)} tasks remaining | {cp_remaining:.0f} days total remaining work
+- Resources: {len(resources)} resources tracked
 """
         if code_success and code_result:
             ctx += f"\nSPECIFIC ANALYSIS RESULTS (use these — do not contradict them):\n{json.dumps(code_result, indent=2, default=str)}\n"
@@ -1135,10 +739,9 @@ INSTRUCTIONS:
 1. Answer ONLY from the data provided. Never invent activities, dates, or numbers.
 2. If analysis results are present, base your answer primarily on those.
 3. Include specific task codes and names when listing activities.
-4. For delayed tasks, always mention downstream cascade impact where relevant.
-5. For critical path tasks, mention the driving predecessor where available.
-6. Highlight concerns with clear recommendations.
-7. Use markdown tables for lists of 5+ items.
-8. If comparing files, show a clear before/after table."""
+4. Highlight concerns with clear recommendations.
+5. Use markdown tables for lists of 5+ items.
+6. If comparing files, show a clear before/after table."""
 
         return ctx
+

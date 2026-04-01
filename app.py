@@ -145,22 +145,12 @@ def load_xer_file(uploaded_file, file_type: str = 'baseline') -> Dict:
         project_info = extractor.get_project_info()
         data_date    = (project_info.get('data_date') or '')[:10]
 
-        # Pass the full structured output so the analyzer and executor
-        # have access to resources, calendars, financial periods, etc.
-        # — not just tasks, wbs, and raw tables.
         data = {
-            'project':           project_info,
-            'tasks':             extractor.get_all_tasks(),
-            'wbs':               extractor.structured.get('wbs', {}),
-            'resources':         extractor.structured.get('resources', []),
-            'roles':             extractor.structured.get('roles', []),
-            'calendars':         extractor.structured.get('calendars', []),
-            'cost_accounts':     extractor.structured.get('cost_accounts', []),
-            'financial_periods': extractor.structured.get('financial_periods', []),
-            'project_codes':     extractor.structured.get('project_codes', {}),
-            'summary':           extractor.structured.get('summary', {}),
-            'parse_report':      extractor.structured.get('parse_report', {}),
-            'tables':            extractor.tables,
+            'project': project_info,
+            'tasks':   extractor.get_all_tasks(),
+            'wbs':     extractor.structured.get('wbs', {}),
+            'summary': extractor.structured.get('summary', {}),
+            'tables':  extractor.tables,
         }
 
         if extractor.parsing_errors:
@@ -228,7 +218,7 @@ def _try_direct_answer(query: str, stats: Dict) -> Optional[str]:
 def get_ai_response(user_query: str) -> str:
     analyzer      = st.session_state.analyzer
     basic_stats   = analyzer.get_basic_stats()
-    insights      = analyzer.get_insights()
+    insights      = analyzer.get_insights()          # pre-computed — no LLM cost
     hybrid_client = _get_hybrid_client()
 
     quick = _try_direct_answer(user_query, basic_stats)
@@ -243,6 +233,7 @@ def get_ai_response(user_query: str) -> str:
     code_success, code_result, code_error, generated_code = False, None, None, ''
 
     try:
+        # ── Generate code ─────────────────────────────────
         code_gen_prompt = analyzer.get_code_generation_prompt(
             user_query, basic_stats, conversation_history=history,
         )
@@ -261,11 +252,13 @@ def get_ai_response(user_query: str) -> str:
         generated_code = _extract_code(raw_code)
         print('GENERATED CODE:\n', generated_code)
 
+        # ── Execute ────────────────────────────────────────
         exec_result  = analyzer.execute_code(generated_code)
         code_success = exec_result['success']
         code_result  = exec_result.get('result')
         code_error   = exec_result.get('error')
 
+        # ── Retry once on failure ──────────────────────────
         if not code_success:
             print(f'Execution failed: {code_error} — retrying...')
             retry_prompt = analyzer.get_code_generation_prompt(
@@ -295,9 +288,10 @@ def get_ai_response(user_query: str) -> str:
         code_error = str(e)
         print(f'Code generation error: {e}')
 
+    # ── Final response ─────────────────────────────────────
     response_prompt = analyzer.get_response_prompt(
         user_query, basic_stats, code_result, code_success, code_error,
-        insights=insights,
+        insights=insights,                            # ← ground-truth insights in LLM context
     )
 
     try:
@@ -323,7 +317,7 @@ def get_ai_response(user_query: str) -> str:
 
 
 # =============================================================================
-# INSIGHTS PANELS
+# INSIGHTS PANELS  (used in sidebar and welcome screen)
 # =============================================================================
 
 def _render_delays_panel(insights: Dict, max_rows: int = 8):
@@ -349,11 +343,8 @@ def _render_critical_path_panel(insights: Dict, max_rows: int = 8):
     remaining_total = sum(t.get('remaining_days', 0) for t in cp)
     st.markdown(f"**{len(cp)} critical tasks** | {remaining_total:.0f}d remaining work")
     for t in cp[:max_rows]:
-        flag  = '🔴' if t.get('has_negative_float') else '🟢 '
-        # Show driving predecessor if available
-        drv   = t.get('driving_predecessor')
-        drv_str = f" ← driven by {drv['task_code']}" if drv else ''
-        label = f"{flag} **{t['task_code']}** {t['task_name'][:30]} — {t['remaining_days']}d rem{drv_str}"
+        flag  = '🔴' if t.get('has_negative_float') else'🟢 '
+        label = f"{flag} **{t['task_code']}** {t['task_name'][:35]} — {t['remaining_days']}d rem"
         st.markdown(f"<div class='insight-card critical'>{label}</div>", unsafe_allow_html=True)
     if len(cp) > max_rows:
         st.caption(f"… and {len(cp) - max_rows} more.")
@@ -364,62 +355,16 @@ def _render_resource_panel(insights: Dict, max_rows: int = 8):
     if not resources:
         st.markdown("*No resource data in schedule.*")
         return
-    total_planned  = sum(r.get('planned_cost', 0) for r in resources)
-    total_actual   = sum(r.get('actual_cost', 0) for r in resources)
-    over_budget    = sum(1 for r in resources if r.get('is_over_budget'))
-    overloaded     = sum(1 for r in resources if r.get('is_overloaded'))
-    st.markdown(
-        f"**{len(resources)} resources** | Planned: {total_planned:,.0f} | "
-        f"Actual: {total_actual:,.0f} | 🔴 Over budget: {over_budget} | ⚠️ Overloaded: {overloaded}"
-    )
+    total_planned = sum(r.get('planned_cost', 0) for r in resources)
+    total_actual  = sum(r.get('actual_cost', 0) for r in resources)
+    st.markdown(f"**{len(resources)} resources** | Planned: {total_planned:,.0f} | Actual: {total_actual:,.0f}")
     for r in resources[:max_rows]:
-        flags = ''
-        if r.get('is_over_budget'):  flags += ' 🔴'
-        if r.get('is_overloaded'):   flags += ' ⚠️'
+        spent_pct = (r['actual_cost'] / r['planned_cost'] * 100) if r['planned_cost'] else 0
         label = (
-            f"**{r['resource_name']}**{flags} — {r['task_count']} tasks | "
-            f"Planned: {r['planned_cost']:,.0f} | Spent: {r['spend_pct']:.0f}% | "
-            f"Variance: {r['cost_variance']:+,.0f}"
+            f"**{r['resource_name']}** — {r['task_count']} tasks | "
+            f"Planned: {r['planned_cost']:,.0f} | Spent: {spent_pct:.0f}%"
         )
         st.markdown(f"<div class='insight-card'>{label}</div>", unsafe_allow_html=True)
-
-
-def _render_propagation_panel(insights: Dict, max_rows: int = 6):
-    """
-    Shows which delayed tasks cascade into downstream work.
-    Each entry lists the source delay, how many tasks are impacted,
-    and the top affected tasks with their estimated impact in days.
-    """
-    prop = insights.get('delay_propagation', [])
-    if not prop:
-        st.markdown('<div class="insight-card ok">✓ No cascade risks detected</div>', unsafe_allow_html=True)
-        return
-
-    total_impacted = sum(p['impacted_task_count'] for p in prop)
-    st.markdown(f"**{len(prop)} delays propagate downstream** — {total_impacted} tasks at risk:")
-
-    for p in prop[:max_rows]:
-        with st.expander(
-            f"🔴 **{p['source_task_code']}** — {p['slip_days']:.0f}d slip "
-            f"→ {p['impacted_task_count']} impacted tasks",
-            expanded=False,
-        ):
-            st.markdown(f"*{p['source_task_name']}*")
-            for it in p['impacted_tasks'][:5]:
-                crit_flag = '🔴' if it['is_critical'] else '🟡'
-                st.markdown(
-                    f"<div class='insight-card'>"
-                    f"{crit_flag} **{it['task_code']}** {it['task_name'][:40]} "
-                    f"— ~{it['estimated_impact_days']:.0f}d impact "
-                    f"(float: {it['available_float']:.0f}d)"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-            if p['impacted_task_count'] > 5:
-                st.caption(f"… and {p['impacted_task_count'] - 5} more. Ask the assistant.")
-
-    if len(prop) > max_rows:
-        st.caption(f"… and {len(prop) - max_rows} more delay chains.")
 
 
 # =============================================================================
@@ -548,15 +493,11 @@ def show_chat_interface():
         with st.expander('Delays', expanded=False):
             _render_delays_panel(insights, max_rows=6)
 
-        with st.expander('Critical Path', expanded=False):
+        with st.expander(' Critical Path', expanded=False):
             _render_critical_path_panel(insights, max_rows=6)
 
-        with st.expander('Resources', expanded=False):
+        with st.expander(' Resources', expanded=False):
             _render_resource_panel(insights, max_rows=6)
-
-        # New: cascade/propagation panel
-        with st.expander('Cascade Risk', expanded=False):
-            _render_propagation_panel(insights, max_rows=4)
 
         st.markdown('---')
         if st.button('Clear Chat', use_container_width=True):
@@ -593,12 +534,11 @@ def show_chat_interface():
         delays    = insights.get('delays', [])
         cp        = insights.get('critical_path', [])
         resources = insights.get('resources', [])
-        prop      = insights.get('delay_propagation', [])
 
         st.markdown("### Schedule Overview")
 
-        tab_health, tab_delays, tab_cascade, tab_cp, tab_resources = st.tabs(
-            [' Health', ' Delays', ' Cascade Risk', ' Critical Path', ' Resources']
+        tab_health, tab_delays, tab_cp, tab_resources = st.tabs(
+            [' Health', ' Delays', ' Critical Path', '\Resources']
         )
 
         with tab_health:
@@ -620,11 +560,9 @@ def show_chat_interface():
             st.markdown(
                 "- Show all critical activities with negative float\n"
                 "- Which tasks are delayed and by how much?\n"
-                "- Which delayed tasks will cascade into critical work?\n"
-                "- What is the driving predecessor for task A1000?\n"
                 "- Compare baseline vs latest update\n"
                 "- List open-ended activities in the civil WBS\n"
-                "- What resources are over-budget or overloaded?"
+                "- What resources are over-budget?"
             )
 
         with tab_delays:
@@ -634,20 +572,9 @@ def show_chat_interface():
             else:
                 st.success("No delays detected — all started/completed tasks are on or ahead of plan.")
 
-        with tab_cascade:
-            if prop:
-                total_at_risk = sum(p['impacted_task_count'] for p in prop)
-                st.markdown(
-                    f"**{len(prop)} delay chains propagate downstream** "
-                    f"— **{total_at_risk}** tasks potentially impacted:"
-                )
-                _render_propagation_panel(insights, max_rows=20)
-            else:
-                st.success("No cascade risks detected — delayed tasks have enough downstream float.")
-
         with tab_cp:
             if cp:
-                cp_remaining    = sum(t.get('remaining_days', 0) for t in cp)
+                cp_remaining = sum(t.get('remaining_days', 0) for t in cp)
                 neg_float_count = sum(1 for t in cp if t.get('has_negative_float'))
                 st.markdown(
                     f"**{len(cp)} remaining critical tasks** | "
@@ -660,18 +587,13 @@ def show_chat_interface():
 
         with tab_resources:
             if resources:
-                total_planned   = sum(r.get('planned_cost', 0) for r in resources)
-                total_actual    = sum(r.get('actual_cost', 0) for r in resources)
+                total_planned  = sum(r.get('planned_cost', 0) for r in resources)
+                total_actual   = sum(r.get('actual_cost', 0) for r in resources)
                 total_remaining = sum(r.get('remaining_cost', 0) for r in resources)
-                over_budget     = sum(1 for r in resources if r.get('is_over_budget'))
-                overloaded      = sum(1 for r in resources if r.get('is_overloaded'))
-
-                c1, c2, c3, c4, c5 = st.columns(5)
+                c1, c2, c3 = st.columns(3)
                 c1.metric('Total Planned Cost', f"{total_planned:,.0f}")
                 c2.metric('Total Actual Cost',  f"{total_actual:,.0f}")
                 c3.metric('Remaining Cost',      f"{total_remaining:,.0f}")
-                c4.metric('🔴 Over Budget',      over_budget)
-                c5.metric('⚠️ Overloaded',       overloaded)
                 st.markdown("---")
                 _render_resource_panel(insights, max_rows=20)
             else:
