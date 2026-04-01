@@ -1,42 +1,42 @@
 """
 XER Schedule AI Assistant
-Robust LLM-powered chat interface for Primavera P6 schedule analysis
+LLM-powered chat interface for Primavera P6 schedule analysis.
 """
 
-import streamlit as st
-import json
 import os
+import sys
+import json
+from typing import Dict, List, Optional
+
+import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Support both .env (local) and Streamlit secrets (cloud)
-def get_openai_key():
-    key = os.getenv('OPENAI_API_KEY')
-    if not key:
-        try:
-            key = st.secrets.get('OPENAI_API_KEY')
-        except:
-            pass
-    return key
-
-from openai import OpenAI
-from xer_analyzer import XERAnalyzer
-
-import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from hybrid_llm import HybridLLMClient
+from xer_analyzer import XERAnalyzer
 from xer_complete_extractor import CompleteXERExtractor
 
 
 # =============================================================================
-# CONFIGURATION
+# CONSTANTS
+# =============================================================================
+
+MAX_FILE_SIZE_MB   = 200
+NEAR_CRITICAL_DAYS = 5
+
+
+# =============================================================================
+# PAGE CONFIG
 # =============================================================================
 
 st.set_page_config(
     page_title="XER Schedule Assistant",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown("""
@@ -44,191 +44,382 @@ st.markdown("""
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     .stDeployButton {display: none;}
-            
     .project-bar {
-        background: #f8f9fa;
-        padding: 10px 20px;
-        border-radius: 8px;
-        margin-bottom: 20px;
-        font-size: 14px;
+        background: #f8f9fa; padding: 10px 20px;
+        border-radius: 8px; margin-bottom: 20px; font-size: 14px;
     }
     .update-file-item {
-        background: #e8f4ea;
-        padding: 8px 12px;
-        border-radius: 6px;
-        margin: 5px 0;
-        font-size: 13px;
+        background: #e8f4ea; padding: 8px 12px;
+        border-radius: 6px; margin: 5px 0; font-size: 13px;
     }
     .baseline-item {
-        background: #e3f2fd;
-        padding: 8px 12px;
-        border-radius: 6px;
-        margin: 5px 0;
-        font-size: 13px;
+        background: #e3f2fd; padding: 8px 12px;
+        border-radius: 6px; margin: 5px 0; font-size: 13px;
+    }
+    .insight-card {
+        background: #fff8e1; padding: 8px 12px;
+        border-radius: 6px; margin: 4px 0; font-size: 12px;
+        border-left: 3px solid #f9a825;
+    }
+    .insight-card.critical {
+        background: #fce4ec;
+        border-left-color: #c62828;
+    }
+    .insight-card.ok {
+        background: #e8f5e9;
+        border-left-color: #2e7d32;
     }
 </style>
 """, unsafe_allow_html=True)
 
 
 # =============================================================================
+# HELPERS
+# =============================================================================
+
+def get_openai_key() -> Optional[str]:
+    key = os.getenv('OPENAI_API_KEY')
+    if not key:
+        try:
+            key = st.secrets.get('OPENAI_API_KEY')
+        except Exception:
+            pass
+    return key or None
+
+
+def _get_hybrid_client() -> HybridLLMClient:
+    if 'hybrid_client' not in st.session_state:
+        st.session_state.hybrid_client = HybridLLMClient(
+            local_model='gemma:2b',
+            cloud_model='gpt-4o-mini',
+            openai_key=get_openai_key(),
+        )
+    return st.session_state.hybrid_client
+
+
+# =============================================================================
 # SESSION STATE
 # =============================================================================
 
-if 'baseline_loaded' not in st.session_state:
-    st.session_state.baseline_loaded = False
-if 'analyzer' not in st.session_state:
+_DEFAULTS = {
+    'baseline_loaded':      False,
+    'analyzer':             None,
+    'messages':             [],
+    'project_name':         None,
+    'baseline_info':        None,
+    'update_files_info':    [],
+    'baseline_file_id':     None,
+    'processed_update_ids': [],
+}
+for key, default in _DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+if st.session_state.analyzer is None:
     st.session_state.analyzer = XERAnalyzer()
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
-if 'project_name' not in st.session_state:
-    st.session_state.project_name = None
-if 'baseline_info' not in st.session_state:
-    st.session_state.baseline_info = None
-if 'update_files_info' not in st.session_state:
-    st.session_state.update_files_info = []
-if 'baseline_file_id' not in st.session_state:
-    st.session_state.baseline_file_id = None
-if 'processed_update_ids' not in st.session_state:
-    st.session_state.processed_update_ids = set()
 
 
 # =============================================================================
 # FILE LOADING
 # =============================================================================
 
-def load_xer_file(uploaded_file, file_type: str = 'baseline') -> dict:
-    """Load and parse XER file"""
+def load_xer_file(uploaded_file, file_type: str = 'baseline') -> Dict:
+    size_mb = uploaded_file.size / (1024 * 1024)
+    if size_mb > MAX_FILE_SIZE_MB:
+        return {'success': False,
+                'error': f"File is {size_mb:.1f} MB — limit is {MAX_FILE_SIZE_MB} MB."}
+
+    temp_path = f"temp_{file_type}_{uploaded_file.name}"
     try:
-        content = uploaded_file.read().decode('utf-8', errors='ignore')
-        temp_path = f"temp_{file_type}_{uploaded_file.name}"
+        raw_bytes = uploaded_file.read()
+        with open(temp_path, 'wb') as f:
+            f.write(raw_bytes)
 
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-
-        extractor = CompleteXERExtractor(temp_path, file_type)
+        extractor = CompleteXERExtractor(
+            temp_path,
+            file_type=file_type,
+            near_critical_days=NEAR_CRITICAL_DAYS,
+        )
         extractor.extract_all()
 
         project_info = extractor.get_project_info()
+        data_date    = (project_info.get('data_date') or '')[:10]
 
+        # Pass the full structured output so the analyzer and executor
+        # have access to resources, calendars, financial periods, etc.
+        # — not just tasks, wbs, and raw tables.
         data = {
-            'project': project_info,
-            'tasks': extractor.get_all_tasks(),
-            'wbs': extractor.get_wbs_structure(),
-            'tables': extractor.tables
+            'project':           project_info,
+            'tasks':             extractor.get_all_tasks(),
+            'wbs':               extractor.structured.get('wbs', {}),
+            'resources':         extractor.structured.get('resources', []),
+            'roles':             extractor.structured.get('roles', []),
+            'calendars':         extractor.structured.get('calendars', []),
+            'cost_accounts':     extractor.structured.get('cost_accounts', []),
+            'financial_periods': extractor.structured.get('financial_periods', []),
+            'project_codes':     extractor.structured.get('project_codes', {}),
+            'summary':           extractor.structured.get('summary', {}),
+            'parse_report':      extractor.structured.get('parse_report', {}),
+            'tables':            extractor.tables,
         }
 
-        data_date = project_info.get('data_date', '')
-        if data_date:
-            data_date = data_date[:10]
-
-        os.remove(temp_path)
+        if extractor.parsing_errors:
+            print(f"[{uploaded_file.name}] Warnings: {extractor.parsing_errors[:3]}")
 
         return {
-            'success': True,
-            'data': data,
+            'success':      True,
+            'data':         data,
             'project_name': project_info.get('project_name', uploaded_file.name),
-            'data_date': data_date,
-            'file_name': uploaded_file.name
+            'data_date':    data_date,
+            'file_name':    uploaded_file.name,
         }
-
     except Exception as e:
         return {'success': False, 'error': str(e)}
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 # =============================================================================
-# AI RESPONSE GENERATION
+# AI RESPONSE
 # =============================================================================
+
+def _extract_code(raw: str) -> str:
+    if '```python' in raw:
+        raw = raw.split('```python')[1].split('```')[0]
+    elif '```' in raw:
+        raw = raw.split('```')[1].split('```')[0]
+    return raw.strip()
+
+
+def _try_direct_answer(query: str, stats: Dict) -> Optional[str]:
+    q = query.lower()
+    checks = [
+        (['how many', 'critical'],
+         f"There are **{stats.get('critical_count','N/A')}** critical activities "
+         f"({stats.get('critical_pct','N/A')}% of total)."),
+        (['negative float'],
+         f"**{stats.get('negative_float_count','N/A')}** activities have negative float."),
+        (['total', 'activit'],
+         f"The schedule contains **{stats.get('total_activities','N/A')}** total activities."),
+        (['open', 'ended'],
+         f"**{stats.get('open_ended_count','N/A')}** open-ended activities (no successors)."),
+        (['dangling'],
+         f"**{stats.get('dangling_count','N/A')}** dangling activities (no predecessors)."),
+        (['long duration'],
+         f"**{stats.get('long_duration_count','N/A')}** activities exceed 30 days duration."),
+        (['how many', 'complet'],
+         f"**{stats.get('completed','N/A')}** complete, "
+         f"**{stats.get('in_progress','N/A')}** in progress, "
+         f"**{stats.get('not_started','N/A')}** not started."),
+        (['total', 'relationship'],
+         f"The schedule has **{stats.get('total_relationships','N/A')}** relationships "
+         f"({stats.get('negative_lags','N/A')} with negative lags)."),
+    ]
+    for keywords, answer in checks:
+        if all(k in q for k in keywords):
+            return answer
+    return None
+
 
 def get_ai_response(user_query: str) -> str:
-    """Generate response using LLM with code generation"""
+    analyzer      = st.session_state.analyzer
+    basic_stats   = analyzer.get_basic_stats()
+    insights      = analyzer.get_insights()
+    hybrid_client = _get_hybrid_client()
 
-    analyzer = st.session_state.analyzer
-    client = OpenAI(api_key=get_openai_key())
+    quick = _try_direct_answer(user_query, basic_stats)
+    if quick:
+        return quick
 
-    # Step 1: Get pre-computed basic stats (always available)
-    basic_stats = analyzer.get_basic_stats()
+    history: List[Dict] = [
+        {'role': m['role'], 'content': m['content']}
+        for m in st.session_state.messages[:-1][-6:]
+    ]
 
-    # Step 2: Generate code to answer the specific question
-    code_gen_prompt = analyzer.get_code_generation_prompt(user_query, basic_stats)
+    code_success, code_result, code_error, generated_code = False, None, None, ''
 
     try:
-        code_response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a Python code generator for Primavera P6 schedule analysis. Generate ONLY valid Python code that sets result = ... at the end. No explanations."
-                },
-                {"role": "user", "content": code_gen_prompt}
-            ],
-            temperature=0.1,
-            max_tokens=2000
+        code_gen_prompt = analyzer.get_code_generation_prompt(
+            user_query, basic_stats, conversation_history=history,
         )
+        raw_code, code_model = hybrid_client.chat(
+            [
+                {'role': 'system', 'content': (
+                    'You are a Python code generator for Primavera P6 schedule analysis. '
+                    'Generate ONLY valid Python code that sets result = ... at the end. '
+                    'No explanations, no markdown.'
+                )},
+                {'role': 'user', 'content': code_gen_prompt},
+            ],
+            temperature=0.1, max_tokens=2000, return_model=True,
+        )
+        print(f'Code generated by: {code_model}')
+        generated_code = _extract_code(raw_code)
+        print('GENERATED CODE:\n', generated_code)
 
-        generated_code = code_response.choices[0].message.content
-
-        # Clean markdown formatting
-        if "```python" in generated_code:
-            generated_code = generated_code.split("```python")[1].split("```")[0]
-        elif "```" in generated_code:
-            generated_code = generated_code.split("```")[1].split("```")[0]
-        generated_code = generated_code.strip()
-
-        # Debug output
-        print("=" * 60)
-        print("GENERATED CODE:")
-        print(generated_code)
-        print("=" * 60)
-
-        # Step 3: Execute the code
-        exec_result = analyzer.execute_code(generated_code)
-
+        exec_result  = analyzer.execute_code(generated_code)
         code_success = exec_result['success']
-        code_result = exec_result.get('result') if code_success else None
-        code_error = exec_result.get('error') if not code_success else None
+        code_result  = exec_result.get('result')
+        code_error   = exec_result.get('error')
 
-        if code_success:
-            print("EXECUTION SUCCESS. Result:", code_result)
-        else:
-            print("EXECUTION FAILED:", code_error)
+        if not code_success:
+            print(f'Execution failed: {code_error} — retrying...')
+            retry_prompt = analyzer.get_code_generation_prompt(
+                user_query, basic_stats,
+                previous_code=generated_code,
+                previous_error=code_error,
+                conversation_history=history,
+            )
+            raw_retry, retry_model = hybrid_client.chat(
+                [
+                    {'role': 'system', 'content': (
+                        'You are a Python code generator. Fix the error. '
+                        'Return ONLY corrected Python code.'
+                    )},
+                    {'role': 'user', 'content': retry_prompt},
+                ],
+                temperature=0.1, max_tokens=2000, return_model=True,
+            )
+            print(f'Retry by: {retry_model}')
+            generated_code = _extract_code(raw_retry)
+            exec_result    = analyzer.execute_code(generated_code)
+            code_success   = exec_result['success']
+            code_result    = exec_result.get('result')
+            code_error     = exec_result.get('error')
 
     except Exception as e:
-        code_success = False
-        code_result = None
         code_error = str(e)
-        print("CODE GENERATION ERROR:", code_error)
+        print(f'Code generation error: {e}')
 
-    # Step 4: Generate final response using all available context
-    response_prompt = analyzer.get_response_prompt(user_query, basic_stats, code_result, code_success, code_error)
+    response_prompt = analyzer.get_response_prompt(
+        user_query, basic_stats, code_result, code_success, code_error,
+        insights=insights,
+    )
 
     try:
-        final_response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": analyzer.get_system_prompt()},
-                {"role": "user", "content": response_prompt}
+        response, response_model = hybrid_client.chat(
+            [
+                {'role': 'system', 'content': analyzer.get_system_prompt()},
+                *history,
+                {'role': 'user', 'content': response_prompt},
             ],
-            temperature=0.3,
-            max_tokens=2000
+            temperature=0.3, max_tokens=2000, return_model=True,
+        )
+        print(f'Response by: {response_model}')
+        return response
+    except Exception as e:
+        return (
+            f"Error generating response.\n\n"
+            f"**Project:** {basic_stats.get('data_source','N/A')} | "
+            f"**Data Date:** {basic_stats.get('data_date','N/A')}\n\n"
+            f"**Activities:** {basic_stats.get('total_activities','N/A')} | "
+            f"**Critical:** {basic_stats.get('critical_count','N/A')} ({basic_stats.get('critical_pct','N/A')}%)\n\n"
+            f"Error: {e}"
         )
 
-        return final_response.choices[0].message.content
 
-    except Exception as e:
-        # Ultimate fallback - return basic stats summary
-        return f"""I encountered an issue generating a detailed response. Here's what I know about your schedule:
+# =============================================================================
+# INSIGHTS PANELS
+# =============================================================================
 
-**Project:** {basic_stats.get('data_source', 'N/A')}
-**Data Date:** {basic_stats.get('data_date', 'N/A')}
-**Total Activities:** {basic_stats.get('total_activities', 'N/A')}
+def _render_delays_panel(insights: Dict, max_rows: int = 8):
+    delays = insights.get('delays', [])
+    if not delays:
+        st.markdown('<div class="insight-card ok">✓ No delays detected</div>', unsafe_allow_html=True)
+        return
+    st.markdown(f"**{len(delays)} delayed tasks** — worst first:")
+    for d in delays[:max_rows]:
+        slip   = d.get('finish_slip_days') or d.get('start_slip_days') or 0
+        flag   = '🔴' if d.get('is_critical') else '🟡'
+        label  = f"{flag} **{d['task_code']}** {d['task_name'][:35]} — {slip:.0f}d slip"
+        st.markdown(f"<div class='insight-card'>{label}</div>", unsafe_allow_html=True)
+    if len(delays) > max_rows:
+        st.caption(f"… and {len(delays) - max_rows} more. Ask the assistant for the full list.")
 
-**Schedule Health:**
-- Critical Activities: {basic_stats.get('critical_count', 'N/A')} ({basic_stats.get('critical_pct', 'N/A')}%)
-- Negative Float: {basic_stats.get('negative_float_count', 'N/A')}
-- Long Duration (>30 days): {basic_stats.get('long_duration_count', 'N/A')}
-- Open-Ended: {basic_stats.get('open_ended_count', 'N/A')}
 
-Error: {str(e)}"""
+def _render_critical_path_panel(insights: Dict, max_rows: int = 8):
+    cp = insights.get('critical_path', [])
+    if not cp:
+        st.markdown("*No critical tasks found.*")
+        return
+    remaining_total = sum(t.get('remaining_days', 0) for t in cp)
+    st.markdown(f"**{len(cp)} critical tasks** | {remaining_total:.0f}d remaining work")
+    for t in cp[:max_rows]:
+        flag  = '🔴' if t.get('has_negative_float') else '🟢 '
+        # Show driving predecessor if available
+        drv   = t.get('driving_predecessor')
+        drv_str = f" ← driven by {drv['task_code']}" if drv else ''
+        label = f"{flag} **{t['task_code']}** {t['task_name'][:30]} — {t['remaining_days']}d rem{drv_str}"
+        st.markdown(f"<div class='insight-card critical'>{label}</div>", unsafe_allow_html=True)
+    if len(cp) > max_rows:
+        st.caption(f"… and {len(cp) - max_rows} more.")
+
+
+def _render_resource_panel(insights: Dict, max_rows: int = 8):
+    resources = insights.get('resources', [])
+    if not resources:
+        st.markdown("*No resource data in schedule.*")
+        return
+    total_planned  = sum(r.get('planned_cost', 0) for r in resources)
+    total_actual   = sum(r.get('actual_cost', 0) for r in resources)
+    over_budget    = sum(1 for r in resources if r.get('is_over_budget'))
+    overloaded     = sum(1 for r in resources if r.get('is_overloaded'))
+    st.markdown(
+        f"**{len(resources)} resources** | Planned: {total_planned:,.0f} | "
+        f"Actual: {total_actual:,.0f} | 🔴 Over budget: {over_budget} | ⚠️ Overloaded: {overloaded}"
+    )
+    for r in resources[:max_rows]:
+        flags = ''
+        if r.get('is_over_budget'):  flags += ' 🔴'
+        if r.get('is_overloaded'):   flags += ' ⚠️'
+        label = (
+            f"**{r['resource_name']}**{flags} — {r['task_count']} tasks | "
+            f"Planned: {r['planned_cost']:,.0f} | Spent: {r['spend_pct']:.0f}% | "
+            f"Variance: {r['cost_variance']:+,.0f}"
+        )
+        st.markdown(f"<div class='insight-card'>{label}</div>", unsafe_allow_html=True)
+
+
+def _render_propagation_panel(insights: Dict, max_rows: int = 6):
+    """
+    Shows which delayed tasks cascade into downstream work.
+    Each entry lists the source delay, how many tasks are impacted,
+    and the top affected tasks with their estimated impact in days.
+    """
+    prop = insights.get('delay_propagation', [])
+    if not prop:
+        st.markdown('<div class="insight-card ok">✓ No cascade risks detected</div>', unsafe_allow_html=True)
+        return
+
+    total_impacted = sum(p['impacted_task_count'] for p in prop)
+    st.markdown(f"**{len(prop)} delays propagate downstream** — {total_impacted} tasks at risk:")
+
+    for p in prop[:max_rows]:
+        with st.expander(
+            f"🔴 **{p['source_task_code']}** — {p['slip_days']:.0f}d slip "
+            f"→ {p['impacted_task_count']} impacted tasks",
+            expanded=False,
+        ):
+            st.markdown(f"*{p['source_task_name']}*")
+            for it in p['impacted_tasks'][:5]:
+                crit_flag = '🔴' if it['is_critical'] else '🟡'
+                st.markdown(
+                    f"<div class='insight-card'>"
+                    f"{crit_flag} **{it['task_code']}** {it['task_name'][:40]} "
+                    f"— ~{it['estimated_impact_days']:.0f}d impact "
+                    f"(float: {it['available_float']:.0f}d)"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            if p['impacted_task_count'] > 5:
+                st.caption(f"… and {p['impacted_task_count'] - 5} more. Ask the assistant.")
+
+    if len(prop) > max_rows:
+        st.caption(f"… and {len(prop) - max_rows} more delay chains.")
 
 
 # =============================================================================
@@ -236,12 +427,11 @@ Error: {str(e)}"""
 # =============================================================================
 
 def show_upload_modal():
-    """Show baseline upload screen"""
     st.markdown("""
-    <div style="display: flex; justify-content: center; align-items: center; min-height: 60vh;">
-        <div style="text-align: center; max-width: 500px; padding: 40px;">
+    <div style="display:flex;justify-content:center;align-items:center;min-height:60vh;">
+        <div style="text-align:center;max-width:500px;padding:40px;">
             <h1>XER Schedule Assistant</h1>
-            <p style="color: #666; margin: 20px 0;">
+            <p style="color:#666;margin:20px 0;">
                 Upload your Primavera P6 baseline XER file to begin analysis
             </p>
         </div>
@@ -249,38 +439,29 @@ def show_upload_modal():
     """, unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns([1, 2, 1])
-
     with col2:
-        st.markdown("### Upload Baseline File")
-
+        st.markdown('### Upload Baseline File')
         uploaded_file = st.file_uploader(
-            "Select XER file",
-            type=['xer'],
-            key='baseline_upload',
-            label_visibility='collapsed'
+            'Select XER file', type=['xer'],
+            key='baseline_upload', label_visibility='collapsed',
         )
-
         if uploaded_file:
             file_id = f"{uploaded_file.name}_{uploaded_file.size}"
             if st.session_state.baseline_file_id != file_id:
-                with st.spinner("Loading baseline..."):
+                with st.spinner('Parsing schedule...'):
                     result = load_xer_file(uploaded_file, 'baseline')
                     if result['success']:
-                        analyzer = st.session_state.analyzer
-                        analyzer.load_baseline(
-                            result['data'],
-                            result['project_name'],
-                            result['data_date']
-                        )
-                        st.session_state.project_name = result['project_name']
-                        st.session_state.baseline_info = {
-                            'name': result['project_name'],
+                        az = st.session_state.analyzer
+                        az.load_baseline(result['data'], result['project_name'], result['data_date'])
+                        st.session_state.project_name     = result['project_name']
+                        st.session_state.baseline_info    = {
+                            'name':      result['project_name'],
                             'data_date': result['data_date'],
-                            'file_name': result['file_name']
+                            'file_name': result['file_name'],
                         }
-                        st.session_state.baseline_loaded = True
+                        st.session_state.baseline_loaded  = True
                         st.session_state.baseline_file_id = file_id
-                        st.success("Baseline loaded!")
+                        st.success('Baseline loaded!')
                         st.rerun()
                     else:
                         st.error(f"Error: {result['error']}")
@@ -291,139 +472,214 @@ def show_upload_modal():
 # =============================================================================
 
 def show_chat_interface():
-    """Show main chat interface"""
-
-    analyzer = st.session_state.analyzer
+    analyzer    = st.session_state.analyzer
     basic_stats = analyzer.get_basic_stats()
+    insights    = analyzer.get_insights()
 
-    # Sidebar
+    # ── Sidebar ───────────────────────────────────────────
     with st.sidebar:
-        st.markdown("### Project Files")
+        st.markdown('### Project Files')
 
-        # Baseline
-        st.markdown("**Baseline:**")
         baseline = st.session_state.baseline_info
         if baseline:
             st.markdown(f"""
             <div class="baseline-item">
                 <strong>{baseline['name']}</strong><br>
                 <small>Data Date: {baseline['data_date'] or 'N/A'}</small>
-            </div>
-            """, unsafe_allow_html=True)
+            </div>""", unsafe_allow_html=True)
 
-        st.markdown("---")
-
-        # Updates
-        st.markdown("**Update Files:**")
+        st.markdown('---')
+        st.markdown('**Update Files:**')
         if st.session_state.update_files_info:
             for i, uf in enumerate(st.session_state.update_files_info):
-                col1, col2 = st.columns([4, 1])
-                with col1:
+                c1, c2 = st.columns([4, 1])
+                with c1:
                     st.markdown(f"""
                     <div class="update-file-item">
                         <strong>{uf['name']}</strong><br>
                         <small>Data Date: {uf['data_date'] or 'N/A'}</small>
-                    </div>
-                    """, unsafe_allow_html=True)
-                with col2:
-                    if st.button("X", key=f"remove_{i}"):
+                    </div>""", unsafe_allow_html=True)
+                with c2:
+                    if st.button('X', key=f'remove_{i}'):
                         st.session_state.update_files_info.pop(i)
-                        st.session_state.processed_update_ids.discard(uf['file_id'])
+                        fid = uf.get('file_id')
+                        if fid in st.session_state.processed_update_ids:
+                            st.session_state.processed_update_ids.remove(fid)
                         analyzer.remove_update(i)
                         st.rerun()
         else:
-            st.markdown("*No updates loaded*")
+            st.markdown('*No updates loaded*')
 
-        st.markdown("---")
-
-        # Add update
-        st.markdown("**Add Update:**")
-        update_file = st.file_uploader("Upload", type=['xer'], key='update_upload', label_visibility='collapsed')
-
+        st.markdown('---')
+        st.markdown('**Add Update:**')
+        update_file = st.file_uploader(
+            'Upload', type=['xer'], key='update_upload', label_visibility='collapsed',
+        )
         if update_file:
             file_id = f"{update_file.name}_{update_file.size}"
             if file_id not in st.session_state.processed_update_ids:
-                with st.spinner("Loading..."):
+                with st.spinner('Loading...'):
                     result = load_xer_file(update_file, 'update')
                     if result['success']:
                         analyzer.add_update(result['data'], result['project_name'], result['data_date'])
                         st.session_state.update_files_info.append({
-                            'name': result['project_name'],
-                            'data_date': result['data_date'],
-                            'file_name': result['file_name'],
-                            'file_id': file_id
+                            'name': result['project_name'], 'data_date': result['data_date'],
+                            'file_name': result['file_name'], 'file_id': file_id,
                         })
-                        st.session_state.processed_update_ids.add(file_id)
+                        st.session_state.processed_update_ids.append(file_id)
                         st.success(f"Loaded: {result['data_date']}")
                         st.rerun()
+                    else:
+                        st.error(f"Error: {result['error']}")
 
-        st.markdown("---")
+        # ── Schedule Health ────────────────────────────────
+        st.markdown('---')
+        st.markdown('### Schedule Health')
+        col_a, col_b = st.columns(2)
+        col_a.metric('Activities', basic_stats.get('total_activities', 0))
+        col_a.metric('Critical %', f"{basic_stats.get('critical_pct', 0)}%")
+        col_a.metric('Neg Float',  basic_stats.get('negative_float_count', 0))
+        col_b.metric('Open-Ended', basic_stats.get('open_ended_count', 0))
+        col_b.metric('Dangling',   basic_stats.get('dangling_count', 0))
+        col_b.metric('Constrained', basic_stats.get('constrained_activities', 0))
 
-        # Quick Stats
-        st.markdown("### Schedule Health")
-        st.markdown(f"- Activities: **{basic_stats.get('total_activities', 0)}**")
-        st.markdown(f"- Critical: **{basic_stats.get('critical_pct', 0)}%**")
-        st.markdown(f"- Neg Float: **{basic_stats.get('negative_float_count', 0)}**")
-        st.markdown(f"- Open-Ended: **{basic_stats.get('open_ended_count', 0)}**")
-        st.markdown(f"- Long Dur: **{basic_stats.get('long_duration_count', 0)}**")
+        # ── Insights panels ────────────────────────────────
+        st.markdown('---')
+        with st.expander('Delays', expanded=False):
+            _render_delays_panel(insights, max_rows=6)
 
-        st.markdown("---")
-        if st.button("Clear Chat", use_container_width=True):
+        with st.expander('Critical Path', expanded=False):
+            _render_critical_path_panel(insights, max_rows=6)
+
+        with st.expander('Resources', expanded=False):
+            _render_resource_panel(insights, max_rows=6)
+
+        # New: cascade/propagation panel
+        with st.expander('Cascade Risk', expanded=False):
+            _render_propagation_panel(insights, max_rows=4)
+
+        st.markdown('---')
+        if st.button('Clear Chat', use_container_width=True):
             st.session_state.messages = []
             st.rerun()
 
-    # Main area - Project bar
-    updates_text = f" | Updates: {len(st.session_state.update_files_info)}" if st.session_state.update_files_info else ""
+    # ── Project bar ───────────────────────────────────────
+    updates_text = (
+        f" | Updates: {len(st.session_state.update_files_info)}"
+        if st.session_state.update_files_info else ''
+    )
     st.markdown(f"""
     <div class="project-bar">
         <strong>Project:</strong> {st.session_state.project_name} |
         <strong>Activities:</strong> {basic_stats.get('total_activities', 0)} |
-        <strong>Period:</strong> {basic_stats.get('project_start', 'N/A')} to {basic_stats.get('project_finish', 'N/A')}{updates_text}
-    </div>
-    """, unsafe_allow_html=True)
+        <strong>Period:</strong> {basic_stats.get('project_start','N/A')} to {basic_stats.get('project_finish','N/A')}{updates_text}
+    </div>""", unsafe_allow_html=True)
 
-    # Chat messages
+    # ── Chat history ──────────────────────────────────────
     for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+        with st.chat_message(msg['role']):
+            st.markdown(msg['content'])
 
-    # Process pending user message
-    if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
-        with st.chat_message("assistant"):
-            with st.spinner("Analyzing schedule..."):
-                response = get_ai_response(st.session_state.messages[-1]["content"])
+    # ── Process pending user message ──────────────────────
+    if st.session_state.messages and st.session_state.messages[-1]['role'] == 'user':
+        with st.chat_message('assistant'):
+            with st.spinner('Analyzing...'):
+                response = get_ai_response(st.session_state.messages[-1]['content'])
             st.markdown(response)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        st.session_state.messages.append({'role': 'assistant', 'content': response})
 
-    # Welcome message
+    # ── Welcome screen ─────────────────────────────────────
     if not st.session_state.messages:
-        st.markdown(f"""
-### Welcome to XER Schedule Assistant
+        delays    = insights.get('delays', [])
+        cp        = insights.get('critical_path', [])
+        resources = insights.get('resources', [])
+        prop      = insights.get('delay_propagation', [])
 
-I'm your Primavera P6 schedule analyst. I can help you with:
+        st.markdown("### Schedule Overview")
 
-**Schedule Quality Analysis:**
-- Long duration activities, open-ended tasks, dangling activities
-- Critical path analysis, negative float identification
-- Constraint analysis, relationship checks
+        tab_health, tab_delays, tab_cascade, tab_cp, tab_resources = st.tabs(
+            [' Health', ' Delays', ' Cascade Risk', ' Critical Path', ' Resources']
+        )
 
-**Comparisons:**
-- Baseline vs update comparisons
-- Changes between monthly updates
-- Progress tracking
+        with tab_health:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric('Total Activities', basic_stats.get('total_activities', 0))
+            c2.metric('Critical',
+                      f"{basic_stats.get('critical_count', 0)} ({basic_stats.get('critical_pct', 0)}%)")
+            c3.metric('Negative Float', basic_stats.get('negative_float_count', 0))
+            c4.metric('In Progress', basic_stats.get('in_progress', 0))
 
-**Current Schedule Health:**
-- **{basic_stats.get('critical_count', 0)}** critical activities ({basic_stats.get('critical_pct', 0)}%)
-- **{basic_stats.get('negative_float_count', 0)}** activities with negative float
-- **{basic_stats.get('long_duration_count', 0)}** activities > 30 days duration
-- **{basic_stats.get('open_ended_count', 0)}** open-ended activities
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric('Open-Ended', basic_stats.get('open_ended_count', 0))
+            c6.metric('Dangling', basic_stats.get('dangling_count', 0))
+            c7.metric('Long Duration >30d', basic_stats.get('long_duration_count', 0))
+            c8.metric('Constrained', basic_stats.get('constrained_activities', 0))
 
-Ask me anything about your schedule!
-        """)
+            st.markdown("---")
+            st.markdown("**Ask me anything about your schedule:**")
+            st.markdown(
+                "- Show all critical activities with negative float\n"
+                "- Which tasks are delayed and by how much?\n"
+                "- Which delayed tasks will cascade into critical work?\n"
+                "- What is the driving predecessor for task A1000?\n"
+                "- Compare baseline vs latest update\n"
+                "- List open-ended activities in the civil WBS\n"
+                "- What resources are over-budget or overloaded?"
+            )
 
-    # Chat input
-    if prompt := st.chat_input("Ask about your schedule..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        with tab_delays:
+            if delays:
+                st.markdown(f"**{len(delays)} tasks are running late** (vs planned dates):")
+                _render_delays_panel(insights, max_rows=15)
+            else:
+                st.success("No delays detected — all started/completed tasks are on or ahead of plan.")
+
+        with tab_cascade:
+            if prop:
+                total_at_risk = sum(p['impacted_task_count'] for p in prop)
+                st.markdown(
+                    f"**{len(prop)} delay chains propagate downstream** "
+                    f"— **{total_at_risk}** tasks potentially impacted:"
+                )
+                _render_propagation_panel(insights, max_rows=20)
+            else:
+                st.success("No cascade risks detected — delayed tasks have enough downstream float.")
+
+        with tab_cp:
+            if cp:
+                cp_remaining    = sum(t.get('remaining_days', 0) for t in cp)
+                neg_float_count = sum(1 for t in cp if t.get('has_negative_float'))
+                st.markdown(
+                    f"**{len(cp)} remaining critical tasks** | "
+                    f"**{cp_remaining:.0f}d** total remaining work | "
+                    f"**{neg_float_count}** with negative float"
+                )
+                _render_critical_path_panel(insights, max_rows=20)
+            else:
+                st.info("No remaining critical work tasks found.")
+
+        with tab_resources:
+            if resources:
+                total_planned   = sum(r.get('planned_cost', 0) for r in resources)
+                total_actual    = sum(r.get('actual_cost', 0) for r in resources)
+                total_remaining = sum(r.get('remaining_cost', 0) for r in resources)
+                over_budget     = sum(1 for r in resources if r.get('is_over_budget'))
+                overloaded      = sum(1 for r in resources if r.get('is_overloaded'))
+
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric('Total Planned Cost', f"{total_planned:,.0f}")
+                c2.metric('Total Actual Cost',  f"{total_actual:,.0f}")
+                c3.metric('Remaining Cost',      f"{total_remaining:,.0f}")
+                c4.metric('🔴 Over Budget',      over_budget)
+                c5.metric('⚠️ Overloaded',       overloaded)
+                st.markdown("---")
+                _render_resource_panel(insights, max_rows=20)
+            else:
+                st.info("No resource assignments found in this schedule.")
+
+    # ── Chat input ────────────────────────────────────────
+    if prompt := st.chat_input('Ask about your schedule...'):
+        st.session_state.messages.append({'role': 'user', 'content': prompt})
         st.rerun()
 
 
@@ -433,8 +689,10 @@ Ask me anything about your schedule!
 
 def main():
     if not get_openai_key():
-        st.error("OPENAI_API_KEY not found. Set it in .env (local) or Streamlit secrets (cloud).")
-        st.stop()
+        st.warning(
+            "OPENAI_API_KEY not found. Cloud model unavailable. "
+            "Set it in .env or Streamlit secrets. Ollama local model will still work if running."
+        )
 
     if not st.session_state.baseline_loaded:
         show_upload_modal()
@@ -442,5 +700,5 @@ def main():
         show_chat_interface()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
