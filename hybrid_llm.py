@@ -14,6 +14,7 @@ class HybridLLMClient:
         self.openai_key = os.getenv("OPENAI_API_KEY")
         self.cloud_client = OpenAI(api_key=self.openai_key) if self.openai_key else None
         self.mode = os.getenv("LLM_MODE", "local")  # 'local' or 'cloud'
+        
 
     def set_mode(self, mode: str):
         """Switch mode at runtime."""
@@ -50,3 +51,18 @@ class HybridLLMClient:
                 print("Cloud model failed:", e_cloud)
 
         raise RuntimeError("No valid LLM available.")
+    
+    def available_providers(self):
+        providers = []
+
+        if self.ollama is not None:
+            providers.append("local")
+
+        if self.cloud_client is not None:
+            providers.append("cloud")
+
+        return providers
+
+
+    def has_provider(self):
+        return len(self.available_providers()) > 0
